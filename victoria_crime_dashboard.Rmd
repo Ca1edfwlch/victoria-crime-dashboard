@@ -1,0 +1,422 @@
+---
+title: "Victoria Crime Dashboard"
+output:
+  flexdashboard::flex_dashboard:
+    orientation: rows
+    vertical_layout: fill
+    theme: flatly
+    css: style.css
+---
+
+```{r setup, include=FALSE}
+library(flexdashboard)
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(plotly)
+library(readxl)
+library(scales)
+library(htmlwidgets)
+
+# Load raw data
+raw <- read_excel("Data_Tables_Recorded_Offences_Visualisation_Year_Ending_December_2025.xlsx",
+                  sheet = "Table 01")
+
+raw <- raw %>%
+  mutate(Population = `Offence Count` / `Rate per 100,000 population` * 100000)
+
+# Shared helpers
+pop_map <- raw %>% group_by(Year) %>% summarise(Pop = first(Population))
+
+rate_by_year <- function(mask) {
+  raw[mask, ] %>%
+    group_by(Year) %>%
+    summarise(Count = sum(`Offence Count`), .groups = "drop") %>%
+    left_join(pop_map, by = "Year") %>%
+    mutate(Rate = Count / Pop * 100000)
+}
+
+div_palette <- c(
+  "A: Crimes Against Person"    = "#00B4D8",
+  "B: Property & Deception"     = "#F77F00",
+  "C: Drug Offences"            = "#80B918",
+  "D: Public Order & Security"  = "#E63946",
+  "E: Justice Procedures"       = "#C77DFF",
+  "F: Other Offences"           = "#06D6A0"
+)
+
+#---------------
+
+# TAB 1: division aggregation
+subdiv <- raw %>%
+  group_by(Year, `Offence Division`, `Offence Subdivision`) %>%
+  summarise(Count = sum(`Offence Count`, na.rm = TRUE),
+            Population = first(Population), .groups = "drop") %>%
+  mutate(
+    Rate     = Count / Population * 100000,
+    Division = case_when(
+      `Offence Division` == "A Crimes against the person"          ~ "A: Crimes Against Person",
+      `Offence Division` == "B Property and deception offences"    ~ "B: Property & Deception",
+      `Offence Division` == "C Drug offences"                      ~ "C: Drug Offences",
+      `Offence Division` == "D Public order and security offences" ~ "D: Public Order & Security",
+      `Offence Division` == "E Justice procedures offences"         ~ "E: Justice Procedures",
+      `Offence Division` == "F Other offences"                     ~ "F: Other Offences",
+      TRUE ~ `Offence Division`
+    )
+  )
+
+division <- subdiv %>%
+  group_by(Year, Division) %>%
+  summarise(Count = sum(Count), Population = first(Population),
+            Rate = sum(Count) / first(Population) * 100000, .groups = "drop")
+
+total_year <- division %>%
+  group_by(Year) %>%
+  summarise(Rate = sum(Count) / first(Population) * 100000,
+            Count = sum(Count), .groups = "drop")
+
+# TAB 1: KPIs
+rate_2016      <- total_year$Rate[total_year$Year == 2016]
+rate_2025      <- total_year$Rate[total_year$Year == 2025]
+pct_change     <- round((rate_2025 - rate_2016) / rate_2016 * 100, 1)
+peak_yr        <- total_year$Year[which.max(total_year$Rate)]
+
+div_change <- division %>%
+  filter(Year %in% c(2016, 2025)) %>%
+  select(Year, Division, Rate) %>%
+  pivot_wider(names_from = Year, values_from = Rate, names_prefix = "Y") %>%
+  mutate(Change = round((Y2025 - Y2016) / Y2016 * 100, 1)) %>%
+  arrange(desc(Change))
+
+most_risen     <- div_change$Division[1]
+most_risen_pct <- div_change$Change[1]
+arrow          <- ifelse(pct_change >= 0, "▲", "▼")
+kpi_col        <- ifelse(pct_change >= 0, "#8b2c2c", "#2c6b3c")
+
+#-----------
+
+# TAB 2: story crimes
+
+fv_breach <- rate_by_year(raw$`Offence Subgroup` == "E21 Breach family violence order") %>%
+  mutate(Series = "Breach Family Violence Order (E21)", Group = "never_stopped")
+
+fv_assault <- rate_by_year(raw$`Offence Subgroup` == "A231 FV Common assault") %>%
+  mutate(Series = "Family Violence Common Assault (A231)", Group = "never_stopped")
+
+nonfv_assault <- rate_by_year(raw$`Offence Subgroup` == "A232 Non-FV Common assault") %>%
+  mutate(Series = "Non-Family Common Assault (A232)", Group = "never_stopped")
+
+retail <- rate_by_year(raw$`Offence Subgroup` == "B43 Steal from a retail store") %>%
+  mutate(Series = "Steal from Retail Store (B43)", Group = "snapback")
+
+motor <- rate_by_year(raw$`Offence Subgroup` == "B41 Motor vehicle theft") %>%
+  mutate(Series = "Motor Vehicle Theft (B41)", Group = "snapback")
+
+story_all <- bind_rows(fv_breach, fv_assault, nonfv_assault, retail, motor)
+
+never_palette <- c(
+  "Breach Family Violence Order (E21)"    = "#E63946",
+  "Family Violence Common Assault (A231)" = "#F77F00",
+  "Non-Family Common Assault (A232)"      = "#6b7280"
+)
+
+snapback_palette <- c(
+  "Steal from Retail Store (B43)" = "#00B4D8",
+  "Motor Vehicle Theft (B41)"     = "#F77F00"
+)
+
+res_burglary <- rate_by_year(raw$`Offence Subgroup` == "B321 Residential non-aggravated burglary") %>%
+  mutate(Series = "Residential Burglary (B321)")
+decline_2 <- bind_rows(res_burglary)
+
+decline_palette <- c(
+  "Residential Burglary (B321)" = "#80B918"
+)
+
+# Shared Y axis — sized to the actual data max (880) across ALL three charts.
+# Same scale on every chart keeps cross-chart comparison honest, but fits the lines.
+STORY_YMAX <- 950
+
+#------------------
+
+# Shared theme
+crime_theme <- theme_minimal(base_size = 11) +
+  theme(
+    plot.background   = element_rect(fill = "#1e2130", color = NA),
+    panel.background  = element_rect(fill = "#1e2130", color = NA),
+    panel.grid.major  = element_line(color = "#2e3450"),
+    panel.grid.minor  = element_blank(),
+    text              = element_text(color = "#e0e0e0"),
+    axis.text         = element_text(color = "#b0b0b0"),
+    axis.title        = element_text(color = "#e0e0e0"),
+    legend.background = element_rect(fill = "#1e2130", color = NA),
+    legend.text       = element_text(color = "#e0e0e0"),
+    plot.title        = element_text(color = "#ffffff", face = "bold", size = 12),
+    plot.subtitle     = element_text(color = "#a0a0a0", size = 9)
+  )
+
+plotly_dark <- function(p, legend_y = -0.28) {
+  p %>%
+    layout(paper_bgcolor = "#1e2130", plot_bgcolor = "#1e2130",
+           font   = list(color = "#e0e0e0"),
+           legend = list(orientation = "h", y = legend_y, font = list(size = 9))) %>%
+    config(displayModeBar = FALSE)
+}
+```
+
+<!-- ================================================================== -->
+<!-- TAB 1: THE BIG PICTURE                                              -->
+<!-- ================================================================== -->
+
+# The Big Picture {data-icon="fa-chart-line"}
+
+## Row — KPIs {data-height=110}
+
+### Total Crime Rate 2025
+```{r}
+valueBox(
+  value   = formatC(round(rate_2025), format = "d", big.mark = ","),
+  caption = "Offences per 100,000 population (2025)",
+  icon    = "fa-shield-alt",
+  color   = "#2c3e6b"
+)
+```
+
+### Change Since 2016
+```{r}
+valueBox(
+  value   = paste0(arrow, " ", abs(pct_change), "%"),
+  caption = "Change in overall crime rate vs 2016",
+  icon    = "fa-percent",
+  color   = kpi_col
+)
+```
+
+### Fastest Rising Division
+```{r}
+valueBox(
+  value   = most_risen,
+  caption = paste0("Fastest growing division (+", most_risen_pct, "% since 2016)"),
+  icon    = "fa-arrow-trend-up",
+  color   = "#6b3d2c"
+)
+```
+
+### Peak Crime Year
+```{r}
+valueBox(
+  value   = peak_yr,
+  caption = "Year with highest recorded crime rate",
+  icon    = "fa-calendar-xmark",
+  color   = "#2c3e6b"
+)
+```
+
+## Row — Charts {data-height=450}
+
+### Total Crime Rate 2016–2025 {data-width=380}
+```{r}
+p_total <- ggplot(total_year,
+                  aes(x = Year, y = Rate,
+                      text = paste0("Year: ", Year,
+                                    "<br>Rate: ", round(Rate, 1), " per 100k",
+                                    "<br>Count: ", formatC(Count, format = "d", big.mark = ",")))) +
+  geom_area(fill = "#2e3450", alpha = 0.6) +
+  geom_line(color = "#00B4D8", linewidth = 1.3) +
+  geom_point(color = "#00B4D8", size = 3) +
+  annotate("rect", xmin = 2019.5, xmax = 2022.5,
+           ymin = -Inf, ymax = Inf, fill = "#06D6A0", alpha = 0.05) +
+  annotate("text", x = 2021, y = 7500,
+           label = "COVID\ndip", size = 2.8, color = "#06D6A0") +
+  geom_hline(yintercept = rate_2016, linetype = "dashed",
+             color = "#6b7280", linewidth = 0.6) +
+  annotate("text", x = 2016.2, y = rate_2016 + 130,
+           label = "2016 baseline", size = 2.6, color = "#6b7280", hjust = 0) +
+  scale_x_continuous(breaks = 2016:2025) +
+  scale_y_continuous(labels = comma, limits = c(7000, 9500)) +
+  labs(title    = "Total Crime Rate — Victoria (2016–2025)",
+       subtitle = "2025 rate of 8,886 nearly matches 2016 peak of 8,922",
+       x = NULL, y = "Rate per 100,000") +
+  crime_theme
+
+plotly_dark(ggplotly(p_total, tooltip = "text"), legend_y = -0.1)
+```
+
+### Crime Rate by Division 2016–2025 {data-width=660}
+```{r}
+p_div <- ggplot(division,
+                aes(x = Year, y = Rate, color = Division, group = Division,
+                    text = paste0("<b>", Division, "</b><br>",
+                                  "Year: ", Year, "<br>",
+                                  "Rate: ", round(Rate, 1), " per 100k<br>",
+                                  "Count: ", formatC(Count, format = "d", big.mark = ",")))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 3) +
+  scale_color_manual(values = div_palette) +
+  scale_x_continuous(breaks = 2016:2025) +
+  scale_y_continuous(labels = comma) +
+  labs(title    = "Crime Rate by Division (2016–2025)",
+       subtitle = "Rates derived from raw offence counts ÷ annual population",
+       x = NULL, y = "Rate per 100,000", color = NULL) +
+  crime_theme +
+  theme(legend.position  = "bottom",
+        legend.key.width = unit(1.4, "cm"),
+        legend.text      = element_text(size = 9))
+
+ggplotly(p_div, tooltip = "text") %>%
+  layout(paper_bgcolor = "#1e2130", plot_bgcolor = "#1e2130",
+         font   = list(color = "#e0e0e0"),
+         yaxis  = list(autorange = TRUE),
+         legend = list(orientation = "h", y = -0.2, font = list(size = 9)),
+         annotations = list(
+           list(
+             x = 2020, y = 581,
+             text = "F92: Public health and \nsafety offences (37,229 cases)<br>Gone by 2022",
+             showarrow = TRUE,
+             arrowhead = 2,
+             arrowsize = 1,
+             arrowcolor = "#06D6A0",
+             ax = 120, ay = -80,
+             font = list(color = "#06D6A0", size = 10),
+             align = "left"
+           )
+         )) %>%
+  config(displayModeBar = FALSE)
+```
+
+## Row — Footer {data-height=40}
+
+### Source
+<div style="background-color:#1e2130; color:#6b7280; font-size:11px; padding:10px 16px;">
+  <b style="color:#a0a0a0;">Data source:</b> Crime Statistics Agency Victoria —
+  <i>Recorded Offences by Offence Type, Year Ending December 2025.</i>
+  Rates derived from raw offence counts ÷ annual population.
+  &nbsp;|&nbsp; Built in R · flexdashboard · plotly
+</div>
+
+<!-- ================================================================== -->
+<!-- TAB 2: THE STORY                                                    -->
+<!-- ================================================================== -->
+
+# The Story {data-icon="fa-book-open"}
+
+## Row — Intro {data-height=10}
+
+<div style="
+     background:#12151f; 
+     padding:10px 20px; 
+     font-size:13px; 
+     color:#a0a0a0; 
+     font-style:italic; 
+     border-left:3px solid #C77DFF;
+     width:100%;
+     box-sizing:border-box;">
+  The total rate returned to 2016 — but underneath, COVID hit different crimes in completely different ways. Three patterns tell the story.
+</div>
+
+## Row — Charts {data-height=390}
+
+### Rose during lockdown {data-width=340}
+```{r}
+p_never <- ggplot(story_all %>% filter(Group == "never_stopped"),
+                  aes(x = Year, y = Rate, color = Series, group = Series,
+                      text = paste0("<b>", Series, "</b><br>Year: ", Year,
+                                    "<br>Rate: ", round(Rate, 1), " per 100k"))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.8) +
+  annotate("rect", xmin = 2019.5, xmax = 2022.5,
+           ymin = -Inf, ymax = Inf, fill = "#ffffff", alpha = 0.03) +
+  annotate("text", x = 2021, y = 900, label = "COVID\nperiod",
+           size = 2.6, color = "#6b7280") +
+  scale_color_manual(values = never_palette) +
+  scale_x_continuous(breaks = 2016:2025) +
+  scale_y_continuous(labels = comma, limits = c(0, STORY_YMAX)) +
+  labs(title    = "Lockdown pushed violence into the home",
+       subtitle = "Family violence rose in 2020; non-family assault fell",
+       x = NULL, y = "Rate per 100,000", color = NULL) +
+  crime_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plotly_dark(ggplotly(p_never, tooltip = "text"))
+```
+
+### Crimes that snapped back harder {data-width=340}
+```{r}
+p_snap <- ggplot(story_all %>% filter(Group == "snapback"),
+                 aes(x = Year, y = Rate, color = Series, group = Series,
+                     text = paste0("<b>", Series, "</b><br>Year: ", Year,
+                                   "<br>Rate: ", round(Rate, 1), " per 100k"))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.8) +
+  annotate("rect", xmin = 2019.5, xmax = 2022.5,
+           ymin = -Inf, ymax = Inf, fill = "#ffffff", alpha = 0.03) +
+  annotate("text", x = 2021, y = 900, label = "COVID\ndip",
+           size = 2.6, color = "#6b7280") +
+  annotate("rect", xmin = 2022.5, xmax = 2025.5,
+           ymin = -Inf, ymax = Inf, fill = "#F77F00", alpha = 0.04) +
+  annotate("text", x = 2024, y = 900, label = "Surged past\npre-COVID",
+           size = 2.4, color = "#F77F00") +
+  scale_color_manual(values = snapback_palette) +
+  scale_x_continuous(breaks = 2016:2025) +
+  scale_y_continuous(labels = comma, limits = c(0, STORY_YMAX)) +
+  labs(title    = "Suppressed by lockdown, then amplified",
+       subtitle = "Both fell when opportunity vanished — then overshot",
+       x = NULL, y = "Rate per 100,000", color = NULL) +
+  crime_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plotly_dark(ggplotly(p_snap, tooltip = "text"))
+```
+
+### Crimes that fell - and stayed down {data-width=340}
+```{r}
+p_down <- ggplot(decline_2,
+                 aes(x = Year, y = Rate, color = Series, group = Series,
+                     text = paste0("<b>", Series, "</b><br>Year: ", Year,
+                                   "<br>Rate: ", round(Rate, 1), " per 100k"))) +
+  geom_line(linewidth = 1.2) +
+  geom_point(size = 2.8) +
+  annotate("rect", xmin = 2019.5, xmax = 2022.5,
+           ymin = -Inf, ymax = Inf, fill = "#ffffff", alpha = 0.03) +
+  annotate("text", x = 2021, y = 900, label = "COVID\nperiod",
+           size = 2.6, color = "#6b7280") +
+  scale_color_manual(values = decline_palette) +
+  scale_x_continuous(breaks = 2016:2025) +
+  scale_y_continuous(labels = comma, limits = c(0, STORY_YMAX)) +
+  labs(title    = "Crimes that fell - and stayed down",
+       subtitle = "Both nearly halved over the decade; no rebound to baseline",
+       x = NULL, y = "Rate per 100,000", color = NULL) +
+  crime_theme +
+  theme(axis.text.x = element_text(angle = 45, hjust = 1))
+
+plotly_dark(ggplotly(p_down, tooltip = "text"))
+```
+
+## Row — Insight cards {data-height=100}
+
+<div style="background:#12151f; border-left:3px solid #E63946; padding:12px 16px; margin:4px; border-radius:4px; font-size:11.5px; color:#e0e0e0; line-height:1.8;">
+  <b>Breach of Family Violence Order</b> jumped 13.5% in 2020 alone, its biggest yearly rise, reaching 880 by 2025.<br>
+  <b>Family Violence Common Assault</b> also rose in 2020, while non-family assault fell.<br>
+  When confinement peaked, violence moved into the home.
+</div>
+
+<div style="background:#12151f; border-left:3px solid #F77F00; padding:12px 16px; margin:4px; border-radius:4px; font-size:11.5px; color:#e0e0e0; line-height:1.8;">
+  <b>Motor vehicle theft</b> fell to 245 in 2022, then surged to 451 by 2025, above its pre-COVID level.<br>
+  <b>Retail theft</b> dropped to 292 when shops closed, then climbed to 585, the highest in the dataset.<br>
+  Lockdowns delayed these crimes but then they returned amplified.
+</div>
+
+<div style="background:#12151f; border-left:3px solid #80B918; padding:12px 16px; margin:4px; border-radius:4px; font-size:11.5px; color:#e0e0e0; line-height:1.8;">
+  <b>Residential burglary</b> fell 45% (534 → 293 per 100k) - 12,000 fewer offences a year.<br>
+  It remains far below the starting point, a lasting decline.
+</div>
+
+## Row — Footer {data-height=40}
+
+### Source
+<div style="background-color:#1e2130; color:#6b7280; font-size:11px; padding:10px 16px;">
+  <b style="color:#a0a0a0;">Data source:</b> Crime Statistics Agency Victoria —
+  <i>Recorded Offences by Offence Type, Year Ending December 2025.</i>
+  Rates derived from raw offence counts ÷ annual population.
+  &nbsp;|&nbsp; Built in R · flexdashboard · plotly
+</div>
